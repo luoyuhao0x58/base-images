@@ -1,0 +1,16 @@
+--- a/Modules/_tkinter.c
++++ b/Modules/_tkinter.c
+@@ -1175,7 +1175,12 @@
+             return NULL;
+         }
+         if (sizeof(Py_UNICODE) == sizeof(Tcl_UniChar))
+-            return Tcl_NewUnicodeObj(inbuf, size);
++            /* Types are layout-compatible in this branch (guarded by the
++               sizeof check above). The cast keeps GCC 14+, which errors on
++               incompatible pointer types by default, happy even though the
++               call is unreachable when Py_UNICODE is wide and Tcl uses
++               UTF-16 (TCL_UTF_MAX == 3). */
++            return Tcl_NewUnicodeObj((const Tcl_UniChar *)inbuf, size);
+         allocsize = ((size_t)size) * sizeof(Tcl_UniChar);
+         if (allocsize >= size)
+             outbuf = (Tcl_UniChar*)attemptckalloc(allocsize);

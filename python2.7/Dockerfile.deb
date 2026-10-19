@@ -1,0 +1,49 @@
+# Stage 1: build python2.7 deb inside a clean trixie container.
+#
+# Everything Python-related comes from the 2.7/ source cache (offline);
+# apt deps are resolved at build time from the configured mirror.
+FROM debian:trixie AS builder
+
+ARG APT_MIRROR=""
+
+# Build dependencies:
+#   tk-dev / libgdbm-dev  -> _tkinter, gdbm/dbm modules
+#   libdb5.3-dev          -> _bsddb, linked against the distribution's libdb
+#   libnsl-dev/libtirpc-dev -> nis (glibc dropped NIS; Debian ships libnsl)
+#   everything else       -> the module set verified during exploration
+RUN if [ -n "$APT_MIRROR" ]; then \
+	sed -i "s|deb.debian.org|${APT_MIRROR}|g" /etc/apt/sources.list.d/*.sources 2>/dev/null || \
+	sed -i "s|deb.debian.org|${APT_MIRROR}|g" /etc/apt/sources.list; \
+	fi && \
+	apt-get update -qq && \
+	apt-get install -y --no-install-recommends \
+	build-essential \
+	patch \
+	xz-utils \
+	bzip2 \
+	python3 \
+	libssl-dev \
+	zlib1g-dev \
+	libbz2-dev \
+	libreadline-dev \
+	libsqlite3-dev \
+	libncurses-dev \
+	libffi-dev \
+	libgdbm-dev \
+	libgdbm-compat-dev \
+	libdb5.3-dev \
+	libnsl-dev \
+	libtirpc-dev \
+	tk-dev \
+	&& apt-get clean && rm -rf /var/lib/apt/lists/*
+
+COPY caches /src/2.7
+COPY patches /src/patches
+COPY build.sh /build.sh
+
+RUN SRC_DIR=/src/2.7 PATCH_DIR=/src/patches OUT_DIR=/out bash /build.sh
+
+# Stage 2: distribution artifact. FROM scratch, single deb at a fixed path
+# so downstream consumers are arch-agnostic (design D9/D10).
+FROM scratch
+COPY --from=builder /out/py27.deb /py27.deb

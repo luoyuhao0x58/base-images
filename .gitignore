@@ -1,0 +1,10 @@
+# Local agent tooling state.
+.pi/
+
+# Build output. Keep it specific: a bare *.deb would also swallow
+# python2.7/Dockerfile.deb, which then never reaches the repository and makes
+# CI fail with "open Dockerfile.deb: no such file or directory".
+python2.7/*.deb
+!python2.7/Dockerfile.deb
+
+/tmp/

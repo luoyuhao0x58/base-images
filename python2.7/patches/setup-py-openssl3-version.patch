@@ -1,0 +1,28 @@
+--- a/setup.py
++++ b/setup.py
+@@ -903,6 +903,25 @@
+                 print "IOError while reading opensshv.h:", msg
+                 pass
+ 
++        # OpenSSL 3.x synthesizes OPENSSL_VERSION_NUMBER via a multi-line
++        # macro expression, which the regex above cannot match. Fall back
++        # to parsing OPENSSL_VERSION_STR ("<major>.<minor>.<patch>").
++        if openssl_ver == 0 and opensslv_h:
++            openssl_ver_str_re = re.compile(
++                '^\s*#\s*define\s+OPENSSL_VERSION_STR\s+"([0-9]+)\.([0-9]+)\.([0-9]+)"')
++            name = os.path.join(opensslv_h[0], 'openssl/opensslv.h')
++            try:
++                incfile = open(name, 'r')
++                for line in incfile:
++                    m = openssl_ver_str_re.match(line)
++                    if m:
++                        openssl_ver = ((int(m.group(1)) << 28) |
++                                       (int(m.group(2)) << 20) |
++                                       (int(m.group(3)) << 4))
++            except IOError, msg:
++                print "IOError while reading opensslv.h:", msg
++                pass
++
+         min_openssl_ver = 0x00907000
+         have_any_openssl = ssl_incs is not None and ssl_libs is not None
+         have_usable_openssl = (have_any_openssl and

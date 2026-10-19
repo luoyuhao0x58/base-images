@@ -1,0 +1,237 @@
+name: build-python27
+
+# Rebuilds the Python 2.7 runtime when python2.7/ changes on main.
+#
+# Two multi-arch images come out of it:
+#   ghcr.io/<owner>/python:2.7-deb   scratch image holding /py27.deb
+#   ghcr.io/<owner>/python:2.7       runtime image with the deb installed
+#
+# Per-arch builds run on native runners (QEMU would make PGO training 5-10x
+# slower), then a merge job stitches the manifests together.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "python2.7/**"
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Push to GHCR (off = build only)"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/python
+  TZ: Asia/Shanghai
+
+jobs:
+  build:
+    runs-on: ${{ matrix.platform == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+    # Every run: step below executes inside python2.7/, so the build context and
+    # the Dockerfile paths are both relative to that directory. uses: steps
+    # (checkout, buildx, login) ignore this, which is what we want.
+    defaults:
+      run:
+        working-directory: python2.7
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [amd64, arm64]
+    env:
+      PUBLISH: ${{ github.event_name == 'push' || inputs.publish }}
+      PLATFORM: ${{ matrix.platform }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        # Default driver (docker-container). The docker driver was tried earlier
+        # because one devbox run with docker-container sat in PGO training for
+        # >20 min versus ~6 min with the docker driver, but that was a single
+        # unpaired measurement and never reproduced on CI. docker-container is
+        # the standard choice: it supports attestations and multi-platform
+        # exports, and this workflow wants OCI media types.
+
+      # Makes buildx-related path surprises diagnosable: a relative --file is
+      # resolved differently by 0.13 (cwd) and newer releases (context).
+      - name: Show buildx version
+        run: docker buildx version
+
+      - name: Login to GHCR
+        if: env.PUBLISH == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build deb artifact image
+        uses: docker/build-push-action@v6
+        env:
+          DOCKER_BUILD_RECORD_UPLOAD: "false"
+        with:
+          context: python2.7
+          file: python2.7/Dockerfile.deb
+          platforms: linux/${{ matrix.platform }}
+          push: ${{ env.PUBLISH == 'true' }}
+          load: ${{ env.PUBLISH != 'true' }}
+          tags: ${{ env.IMAGE }}:2.7-deb-${{ matrix.platform }}
+          # The attestation is an OCI manifest, so enabling provenance forces
+          # the whole index to OCI media types. GHCR kept the child manifests
+          # of the OCI index in ghcr.io/<owner>/devops after their per-arch
+          # tags were deleted, but dropped the children of our plain docker
+          # manifest list, so match the shape that demonstrably survives.
+          provenance: true
+
+      # Install the deb into a clean trixie container and exercise the modules.
+      # A successful compile alone would not catch a broken package. Runs in
+      # both modes: on publish the per-arch tag is pulled back from GHCR (buildx
+      # cannot push and load the same build), otherwise the loaded local image
+      # is used.
+      - name: Verify deb installs on clean trixie
+        run: |
+          set -euo pipefail
+          ARTIFACT="${IMAGE}:2.7-deb-${PLATFORM}"
+          if [ "${PUBLISH}" = "true" ]; then
+            docker pull "$ARTIFACT"
+          fi
+          docker create --name artifact "$ARTIFACT" /py27.deb
+          docker cp artifact:/py27.deb ./py27.deb
+          docker rm artifact
+          docker run --rm \
+            -v "$PWD/py27.deb:/tmp/py27.deb:ro" \
+            debian:trixie \
+            bash -c '
+              set -eux
+              apt-get update -qq
+              # Default install: the deb Recommends ca-certificates, apt has to
+              # pull it in without being asked.
+              apt-get install -y /tmp/py27.deb
+              dpkg -l ca-certificates | grep -q "^ii"
+              python2.7 -V
+              ! test -e /usr/bin/python
+              ! test -e /usr/local/bin/python
+              python2.7 -c "import ssl, bsddb, gdbm, dbm, Tkinter, _hashlib, sqlite3, ctypes, nis; print(\"modules OK |\", ssl.OPENSSL_VERSION)"
+              # Certificate-verified TLS needs the system CA bundle.
+              python2.7 -c "import ssl, socket; s = ssl.create_default_context().wrap_socket(socket.create_connection((\"pypi.org\", 443), timeout=15), server_hostname=\"pypi.org\"); print(\"TLS OK\", s.version())"
+              python2.7 -m pip --version
+              # Third-party install through OpenSSL 3-backed _ssl (PyPI over HTTPS).
+              python2.7 -m pip install --quiet --disable-pip-version-check six==1.16.0
+              python2.7 -c "import six; print(\"six\", six.__version__)"
+              # virtualenv is versioned: python3-virtualenv owns /usr/bin/virtualenv.
+              ! test -e /usr/local/bin/virtualenv
+              virtualenv2 --version
+              virtualenv2 /tmp/venv
+              /tmp/venv/bin/python -V
+              /tmp/venv/bin/pip --version
+              # Must coexist with the python3 stack: python3-pip owns /usr/bin/pip.
+              apt-get install -y -qq python3 python3-pip
+              dpkg -S /usr/bin/pip /usr/local/bin/pip2.7
+              python3 -V
+            '
+
+      - name: Build runtime image
+        uses: docker/build-push-action@v6
+        env:
+          DOCKER_BUILD_RECORD_UPLOAD: "false"
+        with:
+          context: python2.7
+          file: python2.7/Dockerfile
+          platforms: linux/${{ matrix.platform }}
+          build-args: |
+            DEB_IMAGE=${{ env.IMAGE }}:2.7-deb-${{ matrix.platform }}
+          push: ${{ env.PUBLISH == 'true' }}
+          load: ${{ env.PUBLISH != 'true' }}
+          tags: ${{ env.IMAGE }}:2.7-${{ matrix.platform }}
+          provenance: true
+
+      - name: Verify runtime image
+        run: |
+          set -euo pipefail
+          RUNTIME="${IMAGE}:2.7-${PLATFORM}"
+          if [ "${PUBLISH}" = "true" ]; then
+            docker pull "$RUNTIME"
+          fi
+          # The image sets ENTRYPOINT ["/usr/local/bin/python2"], so anything
+          # that is not a python script has to override the entrypoint.
+          docker run --rm "$RUNTIME" -V
+          docker run --rm "$RUNTIME" -c 'import nis, ssl, bsddb; print("runtime OK |", ssl.OPENSSL_VERSION)'
+          docker run --rm --entrypoint python2.7 "$RUNTIME" -m pip --version
+          docker run --rm --entrypoint virtualenv2 "$RUNTIME" --version
+
+  merge:
+    needs: build
+    if: github.event_name == 'push' || inputs.publish
+    runs-on: ubuntu-latest
+    steps:
+      # imagetools only talks to the registry, no builder needed, but buildx
+      # itself has to be installed. The docker driver avoids starting buildkitd.
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver: docker
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Merge 2.7-deb manifest
+        run: |
+          docker buildx imagetools create \
+            -t "${IMAGE}:2.7-deb" \
+            "${IMAGE}:2.7-deb-amd64" \
+            "${IMAGE}:2.7-deb-arm64"
+
+      - name: Merge 2.7 manifest
+        run: |
+          docker buildx imagetools create \
+            -t "${IMAGE}:2.7" \
+            "${IMAGE}:2.7-amd64" \
+            "${IMAGE}:2.7-arm64"
+
+      # Deleting a per-arch tag drops its package version. Whether the child
+      # manifest survives depends on the index media type: the docker manifest
+      # list we used to produce lost its children, the OCI index in
+      # ghcr.io/<owner>/devops kept them. Both builds now set provenance: true,
+      # so this step is being tested against an OCI index. If pulls break
+      # again, drop this step and keep the four per-arch tags.
+      - name: Clean up intermediate per-arch tags
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          OWNER="${{ github.repository_owner }}"
+          PACKAGE="python"
+          SCOPE="user"
+          if curl -fsS -H "Authorization: Bearer $GH_TOKEN" \
+               "https://api.github.com/orgs/$OWNER" >/dev/null 2>&1; then
+            SCOPE="orgs/$OWNER"
+          fi
+          API="https://api.github.com/$SCOPE/packages/container/$PACKAGE/versions"
+          for tag in 2.7-deb-amd64 2.7-deb-arm64 2.7-amd64 2.7-arm64; do
+            echo "== cleanup: $tag =="
+            version_id=$(curl -fsS -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "$API?per_page=100" \
+              | jq -r --arg t "$tag" \
+                '[.[] | select((.metadata.container.tags // []) | index($t)) | .id][0]') || true
+            if [ -n "${version_id:-}" ] && [ "$version_id" != "null" ]; then
+              curl -fsS -X DELETE -H "Authorization: Bearer $GH_TOKEN" \
+                -H "Accept: application/vnd.github+json" \
+                "$API/$version_id" \
+                && echo "  deleted $tag (version $version_id)" \
+                || echo "  WARN: failed to delete $tag"
+            else
+              echo "  $tag not found, skip"
+            fi
+          done
